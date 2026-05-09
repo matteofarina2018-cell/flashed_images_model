@@ -538,8 +538,7 @@ def run_bayes_search(out_dir: str = os.path.join(_HERE, 'bayes_search_results'),
     )
 
     # ── persistent Optuna study ──────────────────────────────────────────────
-    storage_path = os.path.abspath(os.path.join(out_dir, 'optuna.db'))
-    storage_url  = f'sqlite:///{storage_path}'
+    storage_url  = 'postgresql://optuna_user:optuna_pass@localhost:5432/optuna_db'
     study = optuna.create_study(
         direction='maximize',
         sampler=TPESampler(seed=seed, multivariate=True, n_startup_trials=50, gamma=0.4),
