@@ -1,0 +1,22 @@
+# Dati
+*.npz
+*.npy
+
+# Modelli e risultati
+*.pt
+*.db
+outputs/
+bayes_search_results/
+all_results.csv
+
+# Configurazione locale
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Editor
+.vscode/
