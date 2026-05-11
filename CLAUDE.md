@@ -6,16 +6,126 @@ PyTorch model predicting spike responses of 41 retinal ganglion cells (RGCs) to 
 
 ---
 
+## Infrastructure (3-machine cluster)
+
+The bayes_search runs distributed across three NVIDIA DGX Spark units sharing a single Optuna study via a PostgreSQL database.
+
+### Machines
+
+| Alias / MCP name | Hostname | IP | Role |
+|---|---|---|---|
+| **spark-09ab** (hub) | `spark-09ab` | `172.17.12.168` | hosts PostgreSQL server + repo + workers |
+| `spark-fd4b` | `spark-fd4b` | `172.17.12.179` | worker only (DB via SSH tunnel) |
+| `dgx_3` (MCP alias) | `spark-09bd` | `172.17.12.162` | worker only (DB via SSH tunnel) |
+
+> The MCP alias `dgx_3` is **misleading**: the underlying machine is a DGX Spark named `spark-09bd`, not a DGX-3.
+
+### Shared PostgreSQL database (Optuna storage)
+
+- **Server**: native PostgreSQL **16.13** on `spark-09ab`, listening on `127.0.0.1:5432`
+- **Connection URL** (used by `bayes_search.py:541`):
+  ```
+  postgresql://optuna_user:optuna_pass@localhost:5432/optuna_db
+  ```
+- **Database**: `optuna_db`
+- **User / password**: `optuna_user` / `optuna_pass`
+- **Port**: 5432
+
+### How the two worker nodes reach the database
+
+Each remote node opens a persistent SSH local-port-forward to spark-09ab and connects through it. From the worker's point of view, the URL `localhost:5432` resolves to the tunnel endpoint, which forwards to PostgreSQL on spark-09ab.
+
+```bash
+# Tunnel command running on spark-fd4b and spark-09bd (dgx_3):
+ssh -L 5432:localhost:5432 matteo@172.17.12.168 -N -o ServerAliveInterval=60
+```
+
+Lives inside the `tunnel` tmux session on each worker node. **If this tmux dies, all bayes_search workers on that node lose the DB** and their currently running trial becomes a zombie in `RUNNING` state in PostgreSQL (Optuna has no heartbeat timeout).
+
+### Verifying connectivity (any node)
+
+```bash
+PGPASSWORD=optuna_pass psql -U optuna_user -d optuna_db -h localhost \
+  -c "SELECT inet_server_addr(), current_database(), current_user;"
+```
+
+### Shared filesystem (NFS)
+
+`bayes_search_results/` is now a **single shared directory** exported via NFS from the hub. All `model.pt`/`config.json`/`history.json` checkpoints, plus `all_results.csv`, live in one canonical place. Workers across nodes write directly to it — no more per-node copies that diverge.
+
+- **Server**: `nfs-kernel-server` on spark-09ab, listening on `:2049` and `:111`
+- **Export** (`/etc/exports` on hub):
+  ```
+  /home/matteo/flashed_images_model/bayes_search_results 172.17.12.0/24(rw,sync,no_subtree_check,all_squash,anonuid=1002,anongid=1002)
+  ```
+  `all_squash` + `anonuid=1002/anongid=1002` maps every client UID to hub's `matteo` (UID 1002). This is necessary because the three nodes have **different `matteo` UIDs** (hub 1002, spark-09bd 1005, spark-fd4b 1001). On-disk ownership stays consistent (matteo:matteo on the hub); on the clients `ls` may show numeric UID or a coincidentally-mapped local user (e.g. spark-09bd's UID 1002 is `simoneazeglio`) — **cosmetic only, access works correctly**.
+
+- **Client mount** (`/etc/fstab` on each worker that's NFS-attached):
+  ```
+  172.17.12.168:/home/matteo/flashed_images_model/bayes_search_results /home/matteo/flashed_images_model/bayes_search_results nfs defaults,_netdev 0 0
+  ```
+  `_netdev` ensures the mount waits for network availability at boot.
+
+- **Mount status (as of 2026-05-11)**:
+  - ✓ spark-09ab: serving (local path = export source)
+  - ✓ spark-09bd (`dgx_3`): NFS-mounted, fstab persisted
+  - ✗ spark-fd4b: **NOT yet mounted** — user `matteo` is not in sudoers on that node. Until fixed, **do not launch bayes_search workers on spark-fd4b**: they would write to a stale local copy invisible to other nodes (PG would still record completed trials, but checkpoints would diverge). Mount script is pre-staged at `/tmp/setup_nfs_client.sh` on fd4b for when sudo is available.
+
+### Pre-NFS local backups (do not delete until NFS is proven stable)
+
+The migration from per-node local dirs to shared NFS kept full backups on each node:
+- spark-09ab: `bayes_search_results.bak_pre_nfs_20260511_153820/` (hub's pre-merge copy)
+- spark-09bd: `bayes_search_results.pre_nfs_bak_20260511_154623/`
+- spark-fd4b: local `bayes_search_results/` is **untouched** (still the active local copy — it was the source for 68/84 winning criteria during the merge)
+
+Hub also retains `.merge_staging/spark-09bd/` and `.merge_staging/spark-fd4b/` (the rsync snapshots used to compute the merge — ~85 MB total). Safe to delete once the new shared dir is validated.
+
+---
+
+## Git repository
+
+Single GitHub remote, identical on all three machines.
+
+- **Remote URL**: `https://github.com/matteofarina2018-cell/flashed_images_model.git`
+- **Default branch**: `main`
+- **Project path on every machine**: `/home/matteo/flashed_images_model`
+
+### Workflow when modifying code
+
+Code edits should happen on the hub (spark-09ab), then be propagated to the two worker nodes before they pick up the change. Workers do **not** auto-pull.
+
+```bash
+# 1. On the machine where you edited (typically spark-09ab):
+cd /home/matteo/flashed_images_model
+git add -p && git commit -m "..."
+git push origin main
+
+# 2. On each worker node — pull the new commit:
+ssh matteo@172.17.12.179 'cd /home/matteo/flashed_images_model && git pull --ff-only'   # spark-fd4b
+ssh matteo@172.17.12.162 'cd /home/matteo/flashed_images_model && git pull --ff-only'   # dgx_3 / spark-09bd
+
+# 3. Restart the bayes_search workers on each node so they load the new code.
+#    Running workers continue with the old code until restarted.
+```
+
+Worker processes on each node are launched inside the `training` tmux session as:
+```
+python bayes_search.py --out_dir ./bayes_search_results --n_trials 300
+```
+(multiple processes per node — all share the same Optuna study via PostgreSQL).
+
+---
+
 ## Environment
 
 ```bash
 conda activate retina   # always required — base env has no torch
-cd ~/modello_TL3
+cd /home/matteo/flashed_images_model
 ```
 
-**Runtime**: Python 3.11, PyTorch 2.12.0.dev (nightly, CUDA 12.8), Optuna 4.8.0, NumPy 2.4.2  
-**Hardware**: NVIDIA GB10 Blackwell (121 GB VRAM), 121 GB RAM, 20 CPU cores, 3.7 TB NVMe  
-VRAM is not a bottleneck. Model + batch 32 uses ~24 GB. Batch size and model size are unconstrained.  
+**Runtime**: Python 3.11, PyTorch 2.12.0.dev (nightly, CUDA 12.8), Optuna 4.8.0, NumPy 2.4.2
+**Hardware (per node)**: NVIDIA GB10 Blackwell (121 GB VRAM), 121 GB RAM, 20 CPU cores, 3.7 TB NVMe
+VRAM is not a bottleneck. Model + batch 32 uses ~24 GB. Batch size and model size are unconstrained.
 **Training dtype**: `float32` — bf16 kernels are **3× slower** than fp32 on GB10/PyTorch 2.12 nightly (sm_121 not yet fully optimized). When a future nightly fixes bf16, switching back may yield ~2× speedup — change `dtype=torch.float32` → `torch.bfloat16` in `train.py` and `bayes_search.py` and re-benchmark.
 
 ---
@@ -26,7 +136,7 @@ VRAM is not a bottleneck. Model + batch 32 uses ~24 GB. Batch size and model siz
 # Single training run with DEFAULT_CFG → best_model.pt
 python train.py
 
-# Bayesian hyperparameter search — Optuna TPE, auto-resumes from optuna.db
+# Bayesian hyperparameter search — Optuna TPE, auto-resumes from shared PG study
 python bayes_search.py
 
 # Evaluate / plot saved checkpoints (configure flags at top of file first)
@@ -159,7 +269,7 @@ Each bayes_search trial is dominated by:
 | CNN_DIM=8, stride=2, r=4 | 13 | 2k | 14 ms | 1.3s |
 | CNN_DIM=64, stride=2, r=25 | 489 | 170k | 682 ms | 62s |
 
-**At 50 effective epochs**: small configs ~2min/trial, large configs ~52min/trial.  
+**At 50 effective epochs**: small configs ~2min/trial, large configs ~52min/trial.
 LSTA saves <0.1% of trial time — not worth disabling.
 
 **SDPA mask**: `MultiHeadSelfAttention` now uses a **float additive mask** (`0=valid, -inf=masked`)
@@ -193,7 +303,13 @@ evaluated on each neuron's RF ellipse crop. Averaged over 8 reference images fro
 
 ---
 
-## Bayesian search configuration (`model/config.py`)
+## Bayesian search configuration (`model/config.py` + `bayes_search.py`)
+
+**Study identity (PostgreSQL)**:
+- `study_name = 'retinal_radii'`
+- `direction  = 'maximize'`
+- `sampler    = TPESampler(seed, multivariate=True, n_startup_trials=50, gamma=0.4)`
+- Objective: `mean_all` (mean adj R² across 41 neurons)
 
 **Fixed** (`BAYES_FIXED`): `CNN_LAYERS=1, NUM_BLOCKS=1, DROPOUT=0.1, BATCH_SIZE=32, LR=1e-3, WEIGHT_DECAY=0, MAX_EPOCHS=200, EARLY_STOP=30`
 
@@ -205,23 +321,68 @@ evaluated on each neuron's RF ellipse crop. Averaged over 8 reference images fro
 - `NUM_HEADS ∈ {1, 2, 4, 8}`
 - `MLP_DIM ∈ {32, 64, 128, 256}`
 
-**Searched as integers**: 41 radii `r_00…r_40 ∈ [4, 25]` px (in 108×108 space)
+**Searched as integers**: 41 radii `r_00…r_40 ∈ [4, 25]` px (in 108×108 space, `RADII_RANGE` in `config.py`)
 
-Optuna objective: `mean_all` (mean adj R² across 41 neurons). Secondary best-trackers (per-neuron and per-LSTA) run outside Optuna, updated at every improvement, written immediately to disk.
+**Trial budget**: `N_TRIALS_DEFAULT = 200` in `model/config.py`, but workers are currently invoked with `--n_trials 300`. The argument is a **per-worker budget** — workers stop when the global `study.trials` count reaches it, so multiple workers sharing the study finish collectively at the first target reached.
+
+Secondary best-trackers (per-neuron and per-LSTA) run outside Optuna, updated at every improvement, written immediately to disk.
 
 Auto-resume: `create_study(..., load_if_exists=True)` + `_load_existing_csv()` reloads prior bests. Re-running `bayes_search.py` always continues from the last completed trial.
+
+---
+
+## Current bayes_search status
+
+Snapshot from PostgreSQL (`spark-09ab:5432/optuna_db`, study `retinal_radii`) after NFS migration cleanup:
+
+| State | Count |
+|---|---|
+| COMPLETE | 44 |
+| PRUNED | 4 |
+| RUNNING | 0 |
+| FAIL | 0 |
+
+- **Best `mean_all`**: **0.7960** (held by a trial originally completed on spark-fd4b)
+- **All workers stopped** during the NFS migration. To restart, on each NFS-attached node (hub + dgx_3 only, until fd4b is fixed):
+  ```bash
+  conda activate retina && cd /home/matteo/flashed_images_model
+  python bayes_search.py --out_dir ./bayes_search_results --n_trials 300
+  ```
+  Launch inside the `training` tmux session. Multiple processes per node share the PG study.
+
+### Zombie RUNNING trial cleanup (general procedure)
+
+If workers are killed mid-trial (SSH tunnel down, `pkill`, OOM…), Optuna leaves the row as `RUNNING` indefinitely — there is no heartbeat or timeout. Cleanup via SQL transaction:
+```sql
+BEGIN;
+CREATE TEMP TABLE _to_delete AS
+  SELECT trial_id FROM trials WHERE state='RUNNING' AND datetime_start < NOW() - INTERVAL '2 hours';
+DELETE FROM trial_heartbeats        WHERE trial_id IN (SELECT trial_id FROM _to_delete);
+DELETE FROM trial_intermediate_values WHERE trial_id IN (SELECT trial_id FROM _to_delete);
+DELETE FROM trial_values             WHERE trial_id IN (SELECT trial_id FROM _to_delete);
+DELETE FROM trial_params             WHERE trial_id IN (SELECT trial_id FROM _to_delete);
+DELETE FROM trial_system_attributes  WHERE trial_id IN (SELECT trial_id FROM _to_delete);
+DELETE FROM trial_user_attributes    WHERE trial_id IN (SELECT trial_id FROM _to_delete);
+DELETE FROM trials                   WHERE trial_id IN (SELECT trial_id FROM _to_delete);
+COMMIT;
+```
+Tighten the `INTERVAL` threshold based on expected per-trial duration. Optuna's TPE ignores `RUNNING` for fitting anyway — cleanup is purely DB hygiene.
 
 ---
 
 ## Workflow
 
 ```bash
-# Start / resume overnight search
+# Start / resume overnight search on a node
 conda activate retina
-python bayes_search.py   # ctrl+C safe — resumes from optuna.db
+cd /home/matteo/flashed_images_model
+python bayes_search.py   # ctrl+C safe — resumes from shared PG study
 
-# Check results next morning
-# Sort all_results.csv by mean_all column — best config is in bayes_search_results/mean_all/
+# Check progress from anywhere (DB is shared)
+PGPASSWORD=optuna_pass psql -U optuna_user -d optuna_db -h localhost -c \
+  "SELECT state, COUNT(*) FROM trials GROUP BY state;"
+
+# Inspect results CSV (written per-node into ./bayes_search_results/)
 cat bayes_search_results/all_results.csv | python -c "
 import csv,sys; rows=list(csv.DictReader(sys.stdin))
 rows.sort(key=lambda r: float(r['mean_all']), reverse=True)
@@ -234,32 +395,43 @@ for r in rows[:5]: print(r['trial'], r['mean_all'], r['CNN_DIM'], r['CNN_STRIDE'
 python run_evaluate.py
 ```
 
+### Tmux layout on worker nodes (spark-fd4b, spark-09bd)
+
+Each worker node keeps these long-lived tmux sessions:
+- `tunnel`  → SSH local-port-forward to spark-09ab:5432 (must stay up)
+- `training` → the bayes_search worker processes
+
+There is no `claude` session anymore (closed manually). Re-create it with `tmux new -d -s claude` if you need to attach an interactive Claude Code shell on those nodes.
+
 ---
 
 ## Known issues & solutions
 
-**bf16 is 3× SLOWER than fp32 on GB10/PyTorch 2.12 nightly**  
+**bf16 is 3× SLOWER than fp32 on GB10/PyTorch 2.12 nightly**
 → `train.py` and `bayes_search.py` use `dtype=torch.float32` in autocast. Measured: 90.6ms/step (bf16) vs 30.0ms/step (fp32). Reverts to bf16 when a future nightly optimizes sm_121 kernels. See `training_optimization_report.md`.
 
-**SDPA bool mask causes 20× slowdown in bf16** (8.5ms vs 0.4ms/call)  
+**SDPA bool mask causes 20× slowdown in bf16** (8.5ms vs 0.4ms/call)
 → `model/transformer.py` now uses a float additive mask (0=valid, -inf=masked) instead of bool. Neutral in fp32, future-proof for bf16.
 
 **`run_evaluate.py` hardcodes wrong output dir**: `GRID_DIR = 'grid_search_results'` but `bayes_search.py` writes to `bayes_search_results/`. Always update `GRID_DIR` before running evaluation on bayes results.
 
 **Adj R² can be 0 for neurons with c_eo ≤ 0**: if a neuron's responses are anti-correlated between even/odd repetitions (very noisy neuron), the metric is set to 0 regardless of model quality. This is correct per the paper formula, not a bug.
 
-**Trial 9 absent from CSV**: pruned trials (RoPE violation or param overflow) are not written to CSV. Gaps in trial numbers are normal.
+**Pruned trials absent from CSV**: pruned trials (RoPE violation or param overflow) are not written to CSV. Gaps in trial numbers are normal.
+
+**Zombie `RUNNING` trials in PostgreSQL**: if a worker process crashes (or its SSH tunnel dies) mid-trial, Optuna leaves the row as `RUNNING` indefinitely — no heartbeat / timeout. The TPE sampler ignores `RUNNING` rows for fitting but they pollute progress queries. Clean them up manually as shown in the "Current bayes_search status" section.
 
 ---
 
 ## Off-limits
 
 - **`model/losses.py`**: Poisson NLL is theoretically grounded for spike count data. Do not change.
-- **`autocast` dtype**: currently `float32` — do NOT change to `bfloat16` until verified faster (bf16 is 3× slower on GB10/PyTorch 2.12 nightly). Change `float16` is also off-limits.
+- **`autocast` dtype**: currently `float32` — do NOT change to `bfloat16` until verified faster (bf16 is 3× slower on GB10/PyTorch 2.12 nightly). Change to `float16` is also off-limits.
 - **Radii as fixed buffers**: `r` is not a learnable parameter by design. The search explores radii between trials; within a trial they are frozen.
 - **Adj R² formula in `bayes_search.py`**: implements Goldin eq. 5 exactly. Do not simplify or replace with standard R².
 - **Data files** (`PNAS_paper_sorted_data.npz`, `STA/`, `ellipse_centers_exp2.npz`, `lsta_ref.npz`): read-only experimental data, never modify.
 - **Transformer weight sharing**: weights are shared across neurons deliberately (parameter efficiency). Do not add per-neuron transformer weights without understanding the 41× parameter increase.
+- **Shared PostgreSQL credentials**: `optuna_user` / `optuna_pass` are wired into the code. Don't rotate them without updating `bayes_search.py:541` and notifying all worker nodes.
 
 ---
 
@@ -269,8 +441,7 @@ python run_evaluate.py
 train.py:
   best_model.pt                   {epoch, model_state, val_loss, cfg}
 
-bayes_search.py  → bayes_search_results/
-  optuna.db                       Optuna TPE state (SQLite, auto-resume)
+bayes_search.py  → bayes_search_results/   (NFS-shared from spark-09ab; same path on all attached nodes)
   all_results.csv                 one row/trial: hyperparams + val_loss + all scores
   mean_all/
     model.pt  config.json  history.json
@@ -278,6 +449,16 @@ bayes_search.py  → bayes_search_results/
     model.pt  config.json  history.json
   lsta_corr/mean_all/
   lsta_corr/per_neuron/neuron_00/ … neuron_40/
+
+  NOTE 1: Optuna storage is NOT in this directory — it lives in PostgreSQL on spark-09ab.
+  The legacy `optuna.db` SQLite file is no longer used; migration in commit ee8b158.
+
+  NOTE 2: This directory is an NFS mount on all worker nodes (see "Shared filesystem"
+  in the Infrastructure section). Multiple workers across multiple machines write to the
+  same physical files. Concurrent writes to `all_results.csv` and to per-criterion best
+  trackers are NOT currently protected by file locks — race conditions are possible at
+  high writer concurrency. Mitigation (fcntl.flock around the hot paths) is a known
+  follow-up if torn writes are observed.
 
 config.json structure:
   {"score": float, "cfg": {...}, "params": {cnn, neuron_circle, transformer, readout, total}}

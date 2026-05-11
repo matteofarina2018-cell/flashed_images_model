@@ -7,6 +7,9 @@
 *.db
 outputs/
 bayes_search_results/
+bayes_search_results.bak_pre_nfs_*/
+bayes_search_results.pre_nfs_bak_*/
+.merge_staging/
 all_results.csv
 
 # Configurazione locale

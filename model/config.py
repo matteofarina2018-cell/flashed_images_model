@@ -101,7 +101,7 @@ CNN_DIM_EXP_RANGE = (3, 6)
 MLP_DIM_EXP_RANGE = (5, 8)
 
 # Integer range (inclusive) sampled for each of the 41 neuron radii (px in 108×108).
-RADII_RANGE = (4, 35)
+RADII_RANGE = (4, 25)
 
 # Default number of Optuna trials (override via run_bayes_search(n_trials=…)).
 N_TRIALS_DEFAULT = 200
