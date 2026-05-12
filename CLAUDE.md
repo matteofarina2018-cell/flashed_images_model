@@ -66,17 +66,17 @@ PGPASSWORD=optuna_pass psql -U optuna_user -d optuna_db -h localhost \
   ```
   `_netdev` ensures the mount waits for network availability at boot.
 
-- **Mount status (as of 2026-05-11)**:
+- **Mount status (as of 2026-05-12)**:
   - ✓ spark-09ab: serving (local path = export source)
   - ✓ spark-09bd (`dgx_3`): NFS-mounted, fstab persisted
-  - ✗ spark-fd4b: **NOT yet mounted** — user `matteo` is not in sudoers on that node. Until fixed, **do not launch bayes_search workers on spark-fd4b**: they would write to a stale local copy invisible to other nodes (PG would still record completed trials, but checkpoints would diverge). Mount script is pre-staged at `/tmp/setup_nfs_client.sh` on fd4b for when sudo is available.
+  - ✓ spark-fd4b: NFS-mounted, fstab persisted
 
 ### Pre-NFS local backups (do not delete until NFS is proven stable)
 
 The migration from per-node local dirs to shared NFS kept full backups on each node:
 - spark-09ab: `bayes_search_results.bak_pre_nfs_20260511_153820/` (hub's pre-merge copy)
 - spark-09bd: `bayes_search_results.pre_nfs_bak_20260511_154623/`
-- spark-fd4b: local `bayes_search_results/` is **untouched** (still the active local copy — it was the source for 68/84 winning criteria during the merge)
+- spark-fd4b: `bayes_search_results.pre_nfs_bak_20260512_102329/` (the dominant source — 68/84 winning criteria came from this copy)
 
 Hub also retains `.merge_staging/spark-09bd/` and `.merge_staging/spark-fd4b/` (the rsync snapshots used to compute the merge — ~85 MB total). Safe to delete once the new shared dir is validated.
 
@@ -343,7 +343,7 @@ Snapshot from PostgreSQL (`spark-09ab:5432/optuna_db`, study `retinal_radii`) af
 | FAIL | 0 |
 
 - **Best `mean_all`**: **0.7960** (held by a trial originally completed on spark-fd4b)
-- **All workers stopped** during the NFS migration. To restart, on each NFS-attached node (hub + dgx_3 only, until fd4b is fixed):
+- **All workers stopped** during the NFS migration. To restart, on each NFS-attached node (hub + dgx_3 + fd4b):
   ```bash
   conda activate retina && cd /home/matteo/flashed_images_model
   python bayes_search.py --out_dir ./bayes_search_results --n_trials 300
