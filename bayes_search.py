@@ -56,7 +56,12 @@ STA_PATH      = os.path.join(_HERE, 'STA')
 LSTA_REF_PATH = os.path.join(_HERE, 'lsta_ref.npz')   # optional; lsta_corr disabled if missing
 
 # ── Optuna seed (reproducibility) ─────────────────────────────────────────────
-SEED = 42
+# Hostname-derived seed so concurrent workers on different nodes don't
+# generate identical "random" proposals (the seed=42 hard-coded value caused
+# 3 workers to produce identical configs during random startup). Per-node
+# determinism is preserved (same node → same seed → reproducible).
+import hashlib, socket
+SEED = int.from_bytes(hashlib.sha256(socket.gethostname().encode()).digest()[:4], 'big') % (2**31)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
