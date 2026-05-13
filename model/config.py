@@ -90,7 +90,7 @@ BAYES_SPACE = {
     # while the actual values remain exact powers of 2.
     'CNN_KERNEL': [3, 5, 7],
     'CNN_STRIDE': [2],
-    'EMB_DIM':    [None, 32, 64],
+    'EMB_DIM':    [None, 32],
     'NUM_HEADS':  [1, 2, 4, 8],
     'NUM_BLOCKS': [1, 2],
 }
