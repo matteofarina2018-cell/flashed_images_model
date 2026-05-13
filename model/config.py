@@ -89,15 +89,15 @@ BAYES_SPACE = {
     # MLP_DIM_EXP_RANGE below) so the TPE understands their ordinal structure
     # while the actual values remain exact powers of 2.
     'CNN_KERNEL': [3, 5, 7],
-    'CNN_STRIDE': [1, 2],
-    'EMB_DIM':    [None, 32, 64, 128],
+    'CNN_STRIDE': [2],
+    'EMB_DIM':    [None, 32, 64],
     'NUM_HEADS':  [1, 2, 4, 8],
     'NUM_BLOCKS': [1, 2],
 }
 
-# CNN_DIM  = 2^exp  for exp in CNN_DIM_EXP_RANGE  → 8, 16, 32, 64
+# CNN_DIM  = 2^exp  for exp in CNN_DIM_EXP_RANGE  → 8, 16, 32
 # MLP_DIM  = 2^exp  for exp in MLP_DIM_EXP_RANGE  → 32, 64, 128, 256
-CNN_DIM_EXP_RANGE = (3, 6)
+CNN_DIM_EXP_RANGE = (3, 5)
 MLP_DIM_EXP_RANGE = (5, 8)
 
 # Integer range (inclusive) sampled for each of the 41 neuron radii (px in 108×108).
