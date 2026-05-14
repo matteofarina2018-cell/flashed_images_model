@@ -37,6 +37,8 @@ from torch.utils.data import DataLoader
 
 import optuna
 from optuna.samplers import TPESampler
+from optuna.study import MaxTrialsCallback
+from optuna.trial import TrialState as _TS
 
 from data          import RetinalDataset, _NUM_WORKERS, _PIN_MEMORY
 from model.config  import (IN_CHANNELS, N_CELLS, MAX_PARAMS, IMG_SIZE_ORIGINAL,
@@ -546,7 +548,11 @@ def run_bayes_search(out_dir: str = os.path.join(_HERE, 'bayes_search_results'),
     storage_url  = 'postgresql://optuna_user:optuna_pass@localhost:5432/optuna_db'
     study = optuna.create_study(
         direction='maximize',
-        sampler=TPESampler(seed=seed, multivariate=True, n_startup_trials=50, gamma=0.4),
+        sampler=TPESampler(
+            seed=seed, multivariate=True, n_startup_trials=50,
+            # gamma must be callable: top 40% of trials counted as "good"
+            gamma=lambda n: max(1, int(0.4 * n)),
+        ),
         storage=storage_url,
         study_name='retinal_radii',
         load_if_exists=True,
@@ -645,8 +651,11 @@ def run_bayes_search(out_dir: str = os.path.join(_HERE, 'bayes_search_results'),
         return scores['mean_all']
 
     # ── run ──────────────────────────────────────────────────────────────────
+    # Global stop: when the study reaches 500 COMPLETE trials, all workers exit.
+    # Per-worker n_trials is the local budget; MaxTrialsCallback caps the global total.
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False,
-                   gc_after_trial=True)
+                   gc_after_trial=True,
+                   callbacks=[MaxTrialsCallback(500, states=(_TS.COMPLETE,))])
 
     # ── final summary ────────────────────────────────────────────────────────
     print('\n' + '=' * 60)
