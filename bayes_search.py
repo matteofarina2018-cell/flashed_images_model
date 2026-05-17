@@ -66,6 +66,22 @@ import hashlib, socket
 SEED = int.from_bytes(hashlib.sha256(socket.gethostname().encode()).digest()[:4], 'big') % (2**31)
 
 
+# ── Focused search: vary radii only for the hardest neurons ───────────────────
+# Set LOCK_RADII = False to revert to the original full-41-radii search.
+LOCK_RADII = True
+# Indices of the 5 hardest neurons (lowest adj_R² in trial #143). TPE will
+# explore radii ONLY for these — the other 36 are pinned to BEST_RADII[i].
+FREE_NEURONS = {7, 15, 21, 34, 40}
+# Radii from trial #143 (mean_all=0.8140). One value per neuron, indices 0..40.
+BEST_RADII = [
+    23, 8,  8,  4,  16, 14, 13, 25, 6,  4,
+    9,  21, 12, 25, 7,  13, 4,  16, 17, 8,
+    22, 8,  25, 8,  4,  18, 6,  4,  4,  25,
+    9,  25, 16, 13, 20, 4,  13, 13, 21, 20,
+    19,
+]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Criteria
 # ─────────────────────────────────────────────────────────────────────────────
@@ -470,8 +486,15 @@ def _sample_config(trial: optuna.Trial) -> dict:
     }
     arch['CNN_DIM'] = 2 ** trial.suggest_int('CNN_DIM_exp', *CNN_DIM_EXP_RANGE)
     arch['MLP_DIM'] = 2 ** trial.suggest_int('MLP_DIM_exp', *MLP_DIM_EXP_RANGE)
-    radii = [trial.suggest_int(f'r_{i:02d}', RADII_RANGE[0], RADII_RANGE[1])
-             for i in range(N_CELLS)]
+    if LOCK_RADII:
+        radii = [
+            trial.suggest_int(f'r_{i:02d}', RADII_RANGE[0], RADII_RANGE[1])
+            if i in FREE_NEURONS else BEST_RADII[i]
+            for i in range(N_CELLS)
+        ]
+    else:
+        radii = [trial.suggest_int(f'r_{i:02d}', RADII_RANGE[0], RADII_RANGE[1])
+                 for i in range(N_CELLS)]
     return {**BAYES_FIXED, **arch, 'NEURON_RADII': radii}
 
 
@@ -651,11 +674,11 @@ def run_bayes_search(out_dir: str = os.path.join(_HERE, 'bayes_search_results'),
         return scores['mean_all']
 
     # ── run ──────────────────────────────────────────────────────────────────
-    # Global stop: when the study reaches 500 COMPLETE trials, all workers exit.
+    # Global stop: when the study reaches 800 COMPLETE trials, all workers exit.
     # Per-worker n_trials is the local budget; MaxTrialsCallback caps the global total.
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False,
                    gc_after_trial=True,
-                   callbacks=[MaxTrialsCallback(500, states=(_TS.COMPLETE,))])
+                   callbacks=[MaxTrialsCallback(800, states=(_TS.COMPLETE,))])
 
     # ── final summary ────────────────────────────────────────────────────────
     print('\n' + '=' * 60)
