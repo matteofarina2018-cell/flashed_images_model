@@ -12,9 +12,10 @@ import os
 import shutil
 import sys
 
-OUT_ROOT = sys.argv[1] if len(sys.argv) > 1 else './bayes_search_results'
+OUT_ROOT  = sys.argv[1] if len(sys.argv) > 1 else './bayes_search_results'
+RUNS_NAME = sys.argv[2] if len(sys.argv) > 2 else 'retrain_runs'
 
-retrain_root = os.path.join(OUT_ROOT, 'retrain_runs')
+retrain_root = os.path.join(OUT_ROOT, RUNS_NAME)
 seed_dirs = sorted(d for d in os.listdir(retrain_root)
                    if d.startswith('seed_') and os.path.isdir(os.path.join(retrain_root, d)))
 if not seed_dirs:
